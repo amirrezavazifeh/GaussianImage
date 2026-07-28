@@ -90,6 +90,8 @@ class GaussianImage_Cholesky(nn.Module):
         """Cholesky covariance parameters, offset by `cholesky_bound`."""
         return self._cholesky + self.cholesky_bound
 
+
+        
     def forward(self):
         """Projects all Gaussians and rasterizes them into an RGB image."""
         self.xys, depths, self.radii, conics, num_tiles_hit = project_gaussians_2d(
@@ -109,6 +111,8 @@ class GaussianImage_Cholesky(nn.Module):
         render_pkg = self.forward()
         image = render_pkg["render"]
         loss = loss_fn(image, gt_image)
+        if torch.isnan(loss) or torch.isinf(loss):
+            raise RuntimeError(f"Non-finite loss detected — likely a degenerate Gaussian (check cholesky elements).")
         loss.backward()
         with torch.no_grad():
             mse_loss = F.mse_loss(image, gt_image)
