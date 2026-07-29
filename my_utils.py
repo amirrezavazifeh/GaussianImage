@@ -13,7 +13,6 @@ Still requires the compiled `gsplat` CUDA package to be importable.
 Reference: Zhang, Ge et al., "GaussianImage: 1000 FPS Image Representation and
 Compression by 2D Gaussian Splatting", ECCV 2024. https://arxiv.org/abs/2403.08551
 """
-import math
 from pathlib import Path
 
 import numpy as np
@@ -106,22 +105,6 @@ class GaussianImage_Cholesky(nn.Module):
         out_img = out_img.view(-1, self.H, self.W, 3).permute(0, 3, 1, 2).contiguous()
         return {"render": out_img}
 
-    def train_iter(self, gt_image):
-        """Runs one optimization step against `gt_image` and returns (loss, PSNR)."""
-        render_pkg = self.forward()
-        image = render_pkg["render"]
-        loss = loss_fn(image, gt_image)
-        if torch.isnan(loss) or torch.isinf(loss):
-            raise RuntimeError(f"Non-finite loss detected — likely a degenerate Gaussian (check cholesky elements).")
-        loss.backward()
-        with torch.no_grad():
-            mse_loss = F.mse_loss(image, gt_image)
-            psnr = 10 * math.log10(1.0 / mse_loss.item())
-        self.optimizer.step()
-        self.optimizer.zero_grad(set_to_none=True)
-        self.scheduler.step()
-        return loss, psnr
-
 
 # =============================================================================
 # Convenience helpers
@@ -129,7 +112,8 @@ class GaussianImage_Cholesky(nn.Module):
 
 def image_to_tensor(image, device="cuda"):
     """Converts a file path, PIL.Image, or numpy array into a [1, 3, H, W]
-    float tensor in [0, 1], ready for GaussianImage_Cholesky.train_iter()."""
+    float tensor in [0, 1], ready to use as the training target for
+    GaussianImage_Cholesky."""
     from PIL import Image as PILImage
 
     if isinstance(image, (str, Path)):
@@ -149,35 +133,4 @@ def image_to_tensor(image, device="cuda"):
     return tensor.to(device)
 
 
-def fit_gaussian_image(gt_image, num_points=3000, iterations=3000, lr=1e-3,
-                        device="cuda", log_every=25, verbose_every=200):
-    """Fits a GaussianImage_Cholesky model to `gt_image` ([1, 3, H, W] in [0, 1])
-    using L2 (MSE) loss.
 
-    Returns (model, history), where history is a dict with keys
-    'loss', 'psnr' (per-iteration lists) and 'snapshot_iters', 'snapshots'
-    (periodic HxWx3 numpy reconstructions, for visualizing training progress).
-    """
-    H, W = gt_image.shape[2], gt_image.shape[3]
-    model = GaussianImage_Cholesky(
-        num_points=num_points, H=H, W=W,
-        BLOCK_H=16, BLOCK_W=16, device=device, lr=lr,
-    ).to(device)
-
-    history = {"loss": [], "psnr": [], "snapshot_iters": [], "snapshots": []}
-
-    def _render_numpy():
-        with torch.no_grad():
-            return model()["render"][0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
-
-    for it in range(1, iterations + 1):
-        loss, psnr = model.train_iter(gt_image)
-        history["loss"].append(loss.item())
-        history["psnr"].append(psnr)
-        if it == 1 or it % log_every == 0 or it == iterations:
-            history["snapshot_iters"].append(it)
-            history["snapshots"].append(_render_numpy())
-        if verbose_every and (it % verbose_every == 0 or it == iterations):
-            print(f"iter {it:5d}/{iterations} | loss {loss.item():.5f} | PSNR {psnr:.2f} dB")
-
-    return model, history
