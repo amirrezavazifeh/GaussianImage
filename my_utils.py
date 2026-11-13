@@ -58,9 +58,11 @@ class GaussianImage_Cholesky(nn.Module):
 
         # Position (Sec 3.1): unconstrained, mapped to (-1, 1) via tanh.
         self._xyz = nn.Parameter(torch.atanh(2 * (torch.rand(self.init_num_points, 2) - 0.5)))
+        
         # Cholesky vector l = (l1, l2, l3); `cholesky_bound` keeps l1, l3 away from 0.
         self._cholesky = nn.Parameter(torch.rand(self.init_num_points, 3))
         self.register_buffer("_opacity", torch.ones((self.init_num_points, 1)))
+        
         # Weighted color coefficients c' (Eq. 7): merges color + opacity, unconstrained.
         self._features_dc = nn.Parameter(torch.rand(self.init_num_points, 3))
         self.register_buffer("background", torch.ones(3))
@@ -88,8 +90,6 @@ class GaussianImage_Cholesky(nn.Module):
     def get_cholesky_elements(self):
         """Cholesky covariance parameters, offset by `cholesky_bound`."""
         return self._cholesky + self.cholesky_bound
-
-
         
     def forward(self):
         """Projects all Gaussians and rasterizes them into an RGB image."""
