@@ -1,9 +1,9 @@
 """
 Self-contained GaussianImage fitting with a C++/CUDA rasterizer.
 
-Everything needed is in this file plus gi_render.cu (same folder). No gsplat
+Everything needed is in this file plus gi_render.cu (same folder). No gsplat.
 
-Models (same constructor and training loop as before):
+Models: 
   * GaussianImage_Cholesky   Sigma = L L^T          
   * GaussianImage_RS         Sigma = (R S)(R S)^T   
 
@@ -18,7 +18,6 @@ Reference: Zhang, Ge et al., "GaussianImage: 1000 FPS Image Representation and
 Compression by 2D Gaussian Splatting", ECCV 2024. https://arxiv.org/abs/2403.08551
 """
 import math
-import time
 from pathlib import Path
 
 import numpy as np
