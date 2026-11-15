@@ -1,19 +1,18 @@
 """
 Self-contained GaussianImage fitting with a C++/CUDA rasterizer.
 
-Everything needed is in this file plus gi_render.cu (same folder). No gsplat,
-no my_utils2.
+Everything needed is in this file plus gi_render.cu (same folder). No gsplat
 
 Models (same constructor and training loop as before):
-  * GaussianImage_Cholesky   Sigma = L L^T          (paper Eq. 1)
-  * GaussianImage_RS         Sigma = (R S)(R S)^T   (paper Eqs. 2-3)
+  * GaussianImage_Cholesky   Sigma = L L^T          
+  * GaussianImage_RS         Sigma = (R S)(R S)^T   
 
 Each takes backend="cuda" (default when a GPU is present; the custom
 forward/backward kernels in gi_render.cu, JIT-compiled with
 torch.utils.cpp_extension) or backend="torch" (the pure-PyTorch renderer,
 kept as the reference for checking and benchmarking).
 
-Helpers: loss_fn, image_to_tensor, load_extension, check_against_torch, benchmark.
+Helpers: loss_fn, image_to_tensor, load_extension, check_against_torch.
 
 Reference: Zhang, Ge et al., "GaussianImage: 1000 FPS Image Representation and
 Compression by 2D Gaussian Splatting", ECCV 2024. https://arxiv.org/abs/2403.08551
@@ -169,7 +168,7 @@ RENDERERS = {"torch": render_torch, "cuda": render_cuda}
 # =============================================================================
 
 class _GaussianImageBase(nn.Module):
-    """Shared parameters: position (tanh), weighted color (Eq. 7), opacity fixed at 1.
+    """Shared parameters: position (tanh), weighted color, opacity fixed at 1.
     Subclasses add the covariance parameters and `get_cov`."""
 
     def __init__(self, **kwargs):
@@ -177,7 +176,7 @@ class _GaussianImageBase(nn.Module):
         n = self.init_num_points = kwargs["num_points"]
         self.H, self.W = kwargs["H"], kwargs["W"]
         self.device = kwargs["device"]
-        self.backend = kwargs.get("backend", "cuda" if torch.cuda.is_available() else "torch")
+        self.backend = kwargs.get("backend", "cuda" if torch.cuda.is_available() else "torch")  # default for model(); override per call
         if self.backend not in RENDERERS:
             raise ValueError("backend must be 'cuda' or 'torch'")
         # Render window: k-sigma cutoff plus radius floor / cap. BLOCK_* kwargs are ignored.
@@ -216,14 +215,16 @@ class _GaussianImageBase(nn.Module):
         """Opacity, fixed at 1."""
         return self._opacity
 
-    def forward(self):
-        """Render to a (1, 3, H, W) image in [0, 1]."""
-        out = RENDERERS[self.backend](
+    def forward(self, backend=None):
+        """Render to a (1, 3, H, W) image in [0, 1]. `backend` overrides self.backend for this call."""
+        backend = backend or self.backend
+        if backend not in RENDERERS:
+            raise ValueError("backend must be 'cuda' or 'torch'")
+        out = RENDERERS[backend](
             self.get_xyz_pixels, self.get_cov(), self.get_features, self.H, self.W,
             k_sigma=self.k_sigma, min_radius=self.min_radius, max_radius=self.max_radius)
         out = torch.clamp(out, 0, 1)
         return {"render": out.permute(2, 0, 1).unsqueeze(0).contiguous()}
-
 
 class GaussianImage_Cholesky(_GaussianImageBase):
     """2D Gaussians with a Cholesky covariance factor."""
@@ -315,63 +316,3 @@ def check_against_torch(N=2000, H=256, W=256, seed=0, device="cuda"):
         print(f"{name:10s} max abs err {err:.3e}   relative {rel:.3e}")
     print("MATCH" if ok else "MISMATCH -- check the build")
     return ok
-
-
-def _time_steps(model, gt_image, iters, warmup):
-    for i in range(warmup + iters):
-        if i == warmup:
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-        loss = loss_fn(model()["render"], gt_image)
-        loss.backward()
-        model.optimizer.step()
-        model.optimizer.zero_grad(set_to_none=True)
-    torch.cuda.synchronize()
-    step_ms = (time.perf_counter() - t0) / iters * 1000
-
-    with torch.no_grad():
-        for _ in range(warmup):
-            model()
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            model()
-        torch.cuda.synchronize()
-    return step_ms, (time.perf_counter() - t0) / iters * 1000
-
-
-def benchmark(gt_image, num_points_list=(1000, 10000), decompositions=("Cholesky", "RS"),
-              pretrain_iters=2000, iters=200, warmup=20, lr=1e-3, seed=0):
-    """ms per training step and per render, torch vs CUDA, on identical Gaussians
-    taken from a model first trained for `pretrain_iters` steps (Gaussians start
-    tiny, and the torch renderer slows down as they grow)."""
-    device = gt_image.device
-    H, W = gt_image.shape[-2:]
-    load_extension()
-    print(f"GPU: {torch.cuda.get_device_name(device)} | image {H}x{W}")
-    rows = []
-    for dec in decompositions:
-        for n in num_points_list:
-            torch.manual_seed(seed)
-            base = MODELS[dec](num_points=n, H=H, W=W, device=device, lr=lr, backend="cuda").to(device)
-            for _ in range(pretrain_iters):
-                loss_fn(base()["render"], gt_image).backward()
-                base.optimizer.step()
-                base.optimizer.zero_grad(set_to_none=True)
-            state = {k: v.detach().clone() for k, v in base.state_dict().items()}
-
-            res = {}
-            for backend in ("torch", "cuda"):
-                m = MODELS[dec](num_points=n, H=H, W=W, device=device, lr=lr, backend=backend).to(device)
-                m.load_state_dict(state)
-                res[backend] = _time_steps(m, gt_image, iters, warmup)
-                del m
-                torch.cuda.empty_cache()
-
-            (ts, tr), (cs, cr) = res["torch"], res["cuda"]
-            rows.append(dict(decomposition=dec, num_points=n, torch_step_ms=ts, cuda_step_ms=cs,
-                             step_speedup=ts / cs, torch_render_ms=tr, cuda_render_ms=cr,
-                             render_speedup=tr / cr))
-            print(f"{dec:8s} N={n:6d} | train step: torch {ts:7.2f} ms, cuda {cs:6.2f} ms "
-                  f"-> {ts / cs:5.1f}x | render: torch {tr:7.2f} ms, cuda {cr:6.2f} ms -> {tr / cr:5.1f}x")
-    return rows

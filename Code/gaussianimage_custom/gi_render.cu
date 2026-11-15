@@ -1,6 +1,6 @@
 // CUDA forward + backward for GaussianImage's accumulated-sum rasterizer.
 //
-// Same math as my_utils2.render_gaussians_cov:
+// Same math as myrender_gaussians_cov:
 //   out[p] = sum_n  w_n(p) * color_n,   w_n(p) = exp(min(power, 0)),
 //   power  = -0.5 * (A dx^2 + 2 B dx dy + C dy^2),  dx = px - cx, dy = py - cy,
 // over pixels p inside the image with dx^2 + dy^2 <= r_n^2.
