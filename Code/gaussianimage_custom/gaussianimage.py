@@ -12,6 +12,8 @@ forward/backward kernels in gi_render.cu, JIT-compiled with
 torch.utils.cpp_extension) or backend="torch" (the pure-PyTorch renderer,
 kept as the reference for checking and benchmarking).
 
+init_scale=None follows the paper (Gaussians start at ~1 px); a float f starts them at ~f * spacing.
+
 Helpers: loss_fn, image_to_tensor, load_extension, check_against_torch.
 
 Reference: Zhang, Ge et al., "GaussianImage: 1000 FPS Image Representation and
@@ -183,10 +185,18 @@ class _GaussianImageBase(nn.Module):
         self.min_radius = kwargs.get("min_radius", 2)
         self.max_radius = kwargs.get("max_radius", None)
 
+        # None = paper (Gaussians start at ~1 px). A float f starts them at ~f * spacing,
+        # spacing = sqrt(H*W/N), so they overlap from step 1 at any N.
+        init_scale = kwargs.get("init_scale", None)
+        self.init_sigma = None if init_scale is None else init_scale * math.sqrt(self.H * self.W / n)
+
+        # Overlapping Gaussians add up: scale initial colors down so the first render isn't clamped.
+        coverage = 1.0 if init_scale is None else max(1.0, 2 * math.pi * init_scale ** 2)
+        
         self._xyz = nn.Parameter(torch.atanh(2 * (torch.rand(n, 2) - 0.5)))
         self._init_covariance(n)
         self.register_buffer("_opacity", torch.ones((n, 1)))
-        self._features_dc = nn.Parameter(torch.rand(n, 3))
+        self._features_dc = nn.Parameter(torch.rand(n, 3) / coverage)
         self.register_buffer("background", torch.ones(3))
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=kwargs["lr"])
@@ -225,16 +235,21 @@ class _GaussianImageBase(nn.Module):
         out = torch.clamp(out, 0, 1)
         return {"render": out.permute(2, 0, 1).unsqueeze(0).contiguous()}
 
+
 class GaussianImage_Cholesky(_GaussianImageBase):
     """2D Gaussians with a Cholesky covariance factor."""
 
     def _init_covariance(self, n):
         # (l1, l2, l3); `cholesky_bound` adds 0.5 to l1, l3.
-        self._cholesky = nn.Parameter(torch.rand(n, 3))
         self.register_buffer("cholesky_bound", torch.tensor([0.5, 0, 0.5]).view(1, 3))
+        raw = torch.rand(n, 3)
+        if self.init_sigma is not None:   # l = (rand + bound) * sigma instead of rand + bound
+            raw = (raw + self.cholesky_bound) * self.init_sigma - self.cholesky_bound
+        self._cholesky = nn.Parameter(raw)
 
     @property
     def get_cholesky_elements(self):
+        """(l1, l2, l3) in pixels: raw + cholesky_bound."""
         return self._cholesky + self.cholesky_bound
 
     def get_cov(self):
@@ -246,9 +261,12 @@ class GaussianImage_RS(_GaussianImageBase):
 
     def _init_covariance(self, n):
         # Scales (s1, s2) and angle theta; `scaling_bound` adds 0.5 to s1, s2.
-        self._scaling = nn.Parameter(torch.rand(n, 2))
-        self._rotation = nn.Parameter(torch.rand(n, 1))
         self.register_buffer("scaling_bound", torch.tensor([0.5, 0.5]).view(1, 2))
+        raw = torch.rand(n, 2)
+        if self.init_sigma is not None:
+            raw = (raw + self.scaling_bound) * self.init_sigma - self.scaling_bound
+        self._scaling = nn.Parameter(raw)
+        self._rotation = nn.Parameter(torch.rand(n, 1))
 
     @property
     def get_scaling(self):
