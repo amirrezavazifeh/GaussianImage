@@ -18,7 +18,7 @@ kept as the reference for checking and benchmarking).
 
 init_scale=None follows the paper (Gaussians start at ~1 px); a float f starts them at ~f * spacing.
 
-Helpers: loss_fn, image_to_tensor, load_extension, check_against_torch, make_combined_video.
+Helpers: loss_fn, image_to_tensor, load_extension, check_against_torch, make_combined_video, Densifier.
 
 Reference: Zhang, Ge et al., "GaussianImage: 1000 FPS Image Representation and
 Compression by 2D Gaussian Splatting", ECCV 2024. https://arxiv.org/abs/2403.08551
@@ -342,6 +342,120 @@ MODELS = {"Cholesky": GaussianImage_Cholesky, "RS": GaussianImage_RS}
 
 
 # =============================================================================
+# Densification (GaussianImage++, Li et al., AAAI 2026)
+# =============================================================================
+
+def _per_primitive_tensors(model):
+    """Names of the parameters and buffers that have one row per primitive."""
+    n = model._xyz.shape[0]
+    params = [k for k, p in model.named_parameters() if p.dim() >= 1 and p.shape[0] == n]
+    buffers = [k for k, b in model.named_buffers() if b.dim() >= 2 and b.shape[0] == n]
+    return params, buffers
+
+
+def _replace_rows(model, keep, new_rows):
+    """Keep the rows selected by the bool mask `keep` and append `new_rows[name]` for every
+    per-primitive parameter and buffer. Adam moments: kept rows keep theirs, new rows start at 0.
+    model.optimizer and model.scheduler stay valid."""
+    opt = model.optimizer
+    params, buffers = _per_primitive_tensors(model)
+    for name in params:
+        old = getattr(model, name)
+        add = new_rows[name].to(old.device, old.dtype)
+        new = nn.Parameter(torch.cat([old.detach()[keep], add], dim=0))
+        state = opt.state.pop(old, None)
+        if state is not None:
+            for key, v in state.items():
+                if torch.is_tensor(v) and v.shape == old.shape:   # exp_avg, exp_avg_sq
+                    state[key] = torch.cat([v[keep], torch.zeros_like(add)], dim=0)
+            opt.state[new] = state
+        for group in opt.param_groups:
+            group["params"] = [new if p is old else p for p in group["params"]]
+        setattr(model, name, new)
+    for name in buffers:
+        old = getattr(model, name)
+        setattr(model, name, torch.cat([old[keep], new_rows[name].to(old.device, old.dtype)], dim=0))
+
+
+class Densifier:
+    """GaussianImage++-style densification for any model (Cholesky / RS) and kernel.
+
+    Start the model with N0 primitives (GaussianImage++ uses N0 = M / 2); it grows to the budget M:
+      * grow:  every `grow_every` steps (t < iterations) add k = ceil((M - N) / 2) primitives at the
+               k pixels with the largest L1 error; the last growth step adds all that is left.
+               Centers sit on those pixels; colors start at 0 (official code) or at the target
+               color (color_init="target", as in the paper); covariance and kernel parameters are
+               drawn like a fresh model's (paper initialization).
+      * prune: every `prune_every` steps, drop primitives with non-finite values or a
+               degenerate covariance.
+    Call step() once per iteration, after optimizer.step() / zero_grad().
+    """
+
+    def __init__(self, model, max_points, iterations, grow_every=5000, prune_every=100,
+                 color_init="zero"):
+        self.model, self.M, self.T = model, max_points, iterations
+        self.grow_every, self.prune_every = grow_every, prune_every
+        self.color_init = color_init
+        self.last_grow = (iterations - 1) // grow_every * grow_every   # last growth step < iterations
+        self.history = [(0, self.num_points)]                          # (iteration, N) after each change
+
+    @property
+    def num_points(self):
+        return self.model._xyz.shape[0]
+
+    @torch.no_grad()
+    def step(self, it, image, gt_image):
+        changed = False
+        if self.prune_every and it % self.prune_every == 0:
+            changed |= self._prune()
+        if self.grow_every and it % self.grow_every == 0 and it < self.T:
+            changed |= self._grow(it, image, gt_image)
+        if changed:
+            self.history.append((it, self.num_points))
+
+    def _grow(self, it, image, gt_image):
+        m, n = self.model, self.num_points
+        k = self.M - n if it == self.last_grow else math.ceil((self.M - n) / 2)
+        if k <= 0:
+            return False
+        H, W = m.H, m.W
+
+        # Top-k pixels of the per-pixel L1 error (Eq. 3).
+        err = (image - gt_image).abs().sum(dim=1).view(-1)
+        idx = torch.topk(err, k).indices
+        ys, xs = idx // W, idx % W
+
+        # A fresh model of the same class and kernel supplies covariance and kernel parameters.
+        fresh = type(m)(num_points=k, H=H, W=W, device="cpu", lr=1e-3, backend="torch", kernel=m.kernel)
+        rows = dict(fresh.named_parameters())
+        rows.update(dict(fresh.named_buffers()))
+        rows = {name: t.detach() for name, t in rows.items()}
+
+        # Centers on the chosen pixels (inverse of get_xyz_pixels).
+        px = torch.stack([xs, ys], dim=1).float()
+        scale = torch.tensor([W - 1, H - 1], dtype=px.dtype, device=px.device)
+        rows["_xyz"] = torch.atanh((2 * px / scale - 1).clamp(-1 + 1e-4, 1 - 1e-4))
+        if self.color_init == "target":                     # paper, Eq. 4
+            rows["_features_dc"] = gt_image[0, :, ys, xs].T
+        else:                                               # official code: zeros
+            rows["_features_dc"] = torch.zeros(k, 3)
+
+        _replace_rows(m, torch.ones(n, dtype=torch.bool, device=m._xyz.device), rows)
+        return True
+
+    def _prune(self):
+        m = self.model
+        cov = m.get_cov()
+        valid = (cov[:, 0] * cov[:, 2] - cov[:, 1] ** 2 > 0) & (cov[:, 0] > 0) & (cov[:, 2] > 0)
+        params, buffers = _per_primitive_tensors(m)
+        for name in params:
+            valid &= torch.isfinite(getattr(m, name)).flatten(1).all(dim=1)
+        if valid.all() or not valid.any():
+            return False
+        _replace_rows(m, valid, {name: getattr(m, name)[:0] for name in params + buffers})
+        return True
+
+# =============================================================================
 # Helpers
 # =============================================================================
 
@@ -423,9 +537,9 @@ def make_combined_video(histories, num_points_list, gt_image,
     fig, axes = plt.subplots(1, len(num_points_list) + 1,
                              figsize=(3.2 * (len(num_points_list) + 1), 3.6))
     ims = [ax.imshow(histories[n]["snapshots"][0]) for ax, n in zip(axes, num_points_list)]
-    titles = [ax.set_title("", fontsize=10) for ax in axes[:-1]]
+    titles = [ax.set_title("", fontsize=8) for ax in axes[:-1]]
     axes[-1].imshow(gt_np)
-    axes[-1].set_title("Ground truth", fontsize=10)
+    axes[-1].set_title("Ground truth", fontsize=8)
     for ax in axes:
         ax.axis("off")
     plt.tight_layout()
